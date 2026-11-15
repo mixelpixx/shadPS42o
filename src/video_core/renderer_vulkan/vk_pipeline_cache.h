@@ -3,8 +3,14 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
 #include <variant>
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -102,8 +108,19 @@ public:
     }
 
 private:
+    struct PendingGraphicsPipeline {
+        GraphicsPipelineKey key;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        GraphicsPipeline::SerializationSupport sdata;
+        std::array<vk::ShaderModule, MaxShaderStages> modules;
+    };
+
     void CreatePipelineCache(std::span<const u8> initial_data);
     bool IsDriverCacheCompatible(std::span<const u8> data) const;
+    const GraphicsPipeline* GetGraphicsPipelineAsync();
+    void CompileWorker(std::stop_token stoken);
+    void CollectCompiledPipelines();
+    void WaitForPendingPipelines();
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -146,6 +163,17 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    bool async_compile{};
+    tsl::robin_set<GraphicsPipelineKey> pending_graphics_keys;
+    std::mutex compile_mutex;
+    std::condition_variable_any compile_cv;
+    std::condition_variable compile_done_cv;
+    std::queue<PendingGraphicsPipeline> compile_queue;
+    std::vector<std::pair<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>>> compiled;
+    std::atomic<bool> has_compiled{};
+    u32 compiles_in_flight{};
+    std::vector<std::jthread> compile_workers;
 };
 
 } // namespace Vulkan

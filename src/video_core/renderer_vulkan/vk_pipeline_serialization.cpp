@@ -383,6 +383,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    WaitForPendingPipelines();
     if (IsPipelineCacheDirty() && Storage::DataBase::Instance().IsOpened()) {
         auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
         if (result == vk::Result::eSuccess && !data.empty()) {

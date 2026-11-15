@@ -91,8 +91,10 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool defer_build = false);
     ~GraphicsPipeline();
+
+    void Build(std::span<const vk::ShaderModule> modules, const SerializationSupport& sdata);
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -115,6 +117,8 @@ private:
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    vk::PipelineCache driver_cache;
+    bool clip_distance_emulation{};
 };
 
 struct ClipDistanceShaderKey {

@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <ranges>
 
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/polyfill_thread.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -374,6 +377,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (!pipeline_cache) {
         CreatePipelineCache({});
     }
+
+    async_compile = EmulatorSettings.IsAsyncPipelineCompile();
+    if (async_compile) {
+        const u32 num_workers = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
+        for (u32 i = 0; i < num_workers; ++i) {
+            compile_workers.emplace_back(
+                [this](std::stop_token stoken) { CompileWorker(std::move(stoken)); });
+        }
+    }
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -413,6 +425,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    if (async_compile) {
+        return GetGraphicsPipelineAsync();
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -436,6 +451,104 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     }
     return it->second.get();
+}
+
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineAsync() {
+    CollectCompiledPipelines();
+    if (const auto it = graphics_pipelines.find(graphics_key); it != graphics_pipelines.end()) {
+        return it->second.get();
+    }
+    if (pending_graphics_keys.contains(graphics_key)) {
+        return nullptr;
+    }
+
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+    LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} asynchronously", pipeline_hash);
+
+    PendingGraphicsPipeline job{.key = graphics_key};
+    job.pipeline = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+        runtime_infos, fetch_shader, modules, job.sdata, false, true);
+    job.modules = modules;
+
+    RegisterPipelineData(graphics_key, pipeline_hash, job.sdata);
+    ++num_new_pipelines;
+
+    if (EmulatorSettings.IsShaderCollect()) {
+        for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+            if (infos[stage]) {
+                module_related_pipelines[modules[stage]].emplace_back(graphics_key);
+            }
+        }
+    }
+
+    pending_graphics_keys.insert(graphics_key);
+    {
+        std::scoped_lock lk{compile_mutex};
+        compile_queue.push(std::move(job));
+        ++compiles_in_flight;
+    }
+    compile_cv.notify_one();
+    return nullptr;
+}
+
+void PipelineCache::CompileWorker(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:PipelineCompile");
+
+    while (!stoken.stop_requested()) {
+        PendingGraphicsPipeline job;
+        {
+            std::unique_lock lk{compile_mutex};
+            Common::CondvarWait(compile_cv, lk, stoken, [&] { return !compile_queue.empty(); });
+            if (stoken.stop_requested()) {
+                break;
+            }
+            job = std::move(compile_queue.front());
+            compile_queue.pop();
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        job.pipeline->Build(job.modules, job.sdata);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        LOG_INFO(Render_Vulkan, "Compiled graphics pipeline {:#x} in {} ms",
+                 std::hash<GraphicsPipelineKey>{}(job.key),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+
+        {
+            std::scoped_lock lk{compile_mutex};
+            compiled.emplace_back(job.key, std::move(job.pipeline));
+            has_compiled.store(true, std::memory_order_release);
+            --compiles_in_flight;
+        }
+        compile_done_cv.notify_all();
+    }
+}
+
+void PipelineCache::CollectCompiledPipelines() {
+    if (!has_compiled.load(std::memory_order_acquire)) {
+        return;
+    }
+    decltype(compiled) done;
+    {
+        std::scoped_lock lk{compile_mutex};
+        done.swap(compiled);
+        has_compiled.store(false, std::memory_order_release);
+    }
+    for (auto& [key, pipeline] : done) {
+        pending_graphics_keys.erase(key);
+        graphics_pipelines.insert_or_assign(key, std::move(pipeline));
+    }
+}
+
+void PipelineCache::WaitForPendingPipelines() {
+    if (!async_compile) {
+        return;
+    }
+    {
+        std::unique_lock lk{compile_mutex};
+        compile_done_cv.wait(lk, [&] { return compiles_in_flight == 0; });
+    }
+    CollectCompiledPipelines();
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -784,6 +897,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    WaitForPendingPipelines();
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
