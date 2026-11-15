@@ -13,6 +13,7 @@
 
 #include <miniz.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -29,6 +30,8 @@ std::mutex m_request{};
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
+
+constexpr u32 MaxDrainAttempts = 5000;
 
 } // namespace
 
@@ -82,6 +85,9 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     case BlobType::ShaderProfile: {
         return "bin";
     }
+    case BlobType::DriverPipelineCache: {
+        return "vkpc";
+    }
     default:
         UNREACHABLE();
     }
@@ -123,6 +129,16 @@ void DataBase::Open() {
 void DataBase::Close() {
     if (!IsOpened()) {
         return;
+    }
+
+    for (u32 attempt = 0; attempt < MaxDrainAttempts; ++attempt) {
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (!num_requests) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
 
     io_worker.request_stop();

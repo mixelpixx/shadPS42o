@@ -337,6 +337,11 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    std::vector<u8> driver_cache_data{};
+    Storage::DataBase::Instance().Load(Storage::BlobType::DriverPipelineCache, "driver",
+                                       driver_cache_data);
+    CreatePipelineCache(driver_cache_data);
+
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
@@ -378,6 +383,13 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    if (IsPipelineCacheDirty() && Storage::DataBase::Instance().IsOpened()) {
+        auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+        if (result == vk::Result::eSuccess && !data.empty()) {
+            Storage::DataBase::Instance().Save(Storage::BlobType::DriverPipelineCache, "driver",
+                                               std::move(data));
+        }
+    }
     Storage::DataBase::Instance().Close();
 }
 

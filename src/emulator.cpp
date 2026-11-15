@@ -49,6 +49,8 @@
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -61,6 +63,8 @@
 #include <core/file_format/npbind.h>
 
 Frontend::WindowSDL* g_window = nullptr;
+
+extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 namespace Libraries::Kernel {
 extern char const* g_environment[64];
@@ -99,6 +103,9 @@ void Emulator::Shutdown() {
     }
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
+    if (presenter) {
+        presenter->GetRasterizer().GetPipelineCache().Sync();
+    }
     Storage::DataBase::Instance().Close();
     play_time_thread.request_stop();
     if (play_time_thread.joinable()) {

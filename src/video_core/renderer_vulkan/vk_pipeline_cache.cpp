@@ -371,13 +371,42 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     WarmUp();
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    if (!pipeline_cache) {
+        CreatePipelineCache({});
+    }
+}
+
+PipelineCache::~PipelineCache() = default;
+
+void PipelineCache::CreatePipelineCache(std::span<const u8> initial_data) {
+    if (!IsDriverCacheCompatible(initial_data)) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache isn't compatible with current device");
+        initial_data = {};
+    }
+    const vk::PipelineCacheCreateInfo cache_info{
+        .initialDataSize = initial_data.size(),
+        .pInitialData = initial_data.data(),
+    };
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_info);
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+bool PipelineCache::IsDriverCacheCompatible(std::span<const u8> data) const {
+    if (data.empty()) {
+        return true;
+    }
+    vk::PipelineCacheHeaderVersionOne header{};
+    if (data.size() < sizeof(header)) {
+        return false;
+    }
+    std::memcpy(&header, data.data(), sizeof(header));
+    const auto properties = instance.GetPhysicalDevice().getProperties();
+    return header.headerVersion == vk::PipelineCacheHeaderVersion::eOne &&
+           header.vendorID == properties.vendorID && header.deviceID == properties.deviceID &&
+           std::ranges::equal(header.pipelineCacheUUID, properties.pipelineCacheUUID);
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;

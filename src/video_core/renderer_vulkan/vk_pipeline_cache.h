@@ -102,6 +102,8 @@ public:
     }
 
 private:
+    void CreatePipelineCache(std::span<const u8> initial_data);
+    bool IsDriverCacheCompatible(std::span<const u8> data) const;
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
