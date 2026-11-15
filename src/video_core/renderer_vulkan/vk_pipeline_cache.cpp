@@ -5,6 +5,7 @@
 #include <chrono>
 #include <ranges>
 
+#include "common/debug.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -92,6 +93,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 }
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
+    RENDERER_TRACE;
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = liverpool->regs;
     const auto BuildCommon = [&](const auto& program) {
@@ -421,6 +423,7 @@ bool PipelineCache::IsDriverCacheCompatible(std::span<const u8> data) const {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    RENDERER_TRACE;
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -552,6 +555,7 @@ void PipelineCache::WaitForPendingPipelines() {
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    RENDERER_TRACE;
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -576,6 +580,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
+    RENDERER_TRACE;
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -683,6 +688,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 bool PipelineCache::RefreshGraphicsStages() {
+    RENDERER_TRACE;
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
@@ -813,6 +819,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    RENDERER_TRACE;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -846,6 +853,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    RENDERER_TRACE;
     auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
@@ -868,15 +876,24 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    {
+        ZoneScopedNC("RefreshFlatBuf", RendererMarkerColor);
+        info.RefreshFlatBuf();
+    }
+    auto spec = [&] {
+        ZoneScopedNC("StageSpecialization", RendererMarkerColor);
+        return Shader::StageSpecialization(info, runtime_info, profile, binding);
+    }();
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    const auto it = [&] {
+        ZoneScopedNC("FindPermutation", RendererMarkerColor);
+        return std::ranges::find(program->modules, spec, &Program::Module::spec);
+    }();
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
